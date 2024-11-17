@@ -1344,6 +1344,12 @@ ${某某某_LIBRARIES}
 locate eigen | grep cmake
 ```
 
+```
+cmake -D CMAKE_BUILD_TYPE=RELEASE -D CMAKE_INSTALL_PREFIX=/opt/libtorch -D CMAKE_CXX_STANDARD=17 -D CMAKE_CXX_STANDARD_REQUIRED=ON -D USE_CUDA=ON -D USE_CUDNN=ON -D USE_OPENCV=OFF -D BUILD_CAFFE2_MOBILE=OFF -D BUILD_PYTHON=OFF -D BUILD_CAFFE2_OPS=OFF -D BUILD_TEST=OFF -D USE_TBB=OFF ..
+
+                           
+```
+
 如下：
 
 ![image-20240922165549998](C:\Users\zbw\AppData\Roaming\Typora\typora-user-images\image-20240922165549998.png)
@@ -2351,7 +2357,408 @@ setTo直接对三个通道操作
 
 **（8）计算深度**
 
+根据图片将像素点转为相机坐标系下的坐标，然后根据双目计算深度的公式得到深度即Z坐标，
 
+那么为什么x轴，y轴坐标要乘以depth？
+
+其实很简单，因为这张图片上的东西距离镜头的距离就是这个深度，那么恢复出来的东西就应该在那个深度距离的平面上
+
+你可以实验一下不去乘以这个深度，最后呈现出的画面将会有很大的问题！
+
+```
+for (int v = 0; v < left.rows; v++) {
+        for (int u = 0; u < left.cols; u++) {
+            if (disparity.at<float>(v, u) <= 0.0 || disparity.at<float>(v, u) >= 96.0) continue;
+
+            Vector4d point(0, 0, 0, left.at<uchar>(v, u) / 255.0); // 前三维为xyz,第四维为颜色
+
+            // 根据双目模型计算 point 的位置
+            double x = (u - cx) / fx;
+            double y = (v - cy) / fy;
+            double depth = fx * b / (disparity.at<float>(v, u)); // depth = f*b / d ,d为视差(左右目图像横坐标的差)
+            point[0] = x * depth;
+            point[1] = y * depth;
+            point[2] = depth;
+
+            pointcloud.push_back(point);
+        }
+    }
+    cv::imshow("disparity", disparity / 96.0);
+    cv::waitKey(0);
+    // 画出点云，在相机坐标系下的点云
+    showPointCloud(pointcloud);
+```
+
+其中的disparity是由sgbm算法得到的视差（描述同一个点在左右目上成像的距离）
+
+**（9）对不同位姿得到的图片进行点云拼接**
+
+思路：
+
+1.读取5张图片的颜色与深度信息，
+
+这五张mat又放在一个vector里，
+
+2.读取每张图片的位姿信息
+
+他是一个Sophus::SE3d，里面包括四元数和坐标，之后同样放在一个vector中
+
+3.遍历五张图像
+
+先得到相机坐标系下的坐标再转到世界坐标系下，并读取每个像素的BGR，其是一个6维的eigen中的vector，再将其放入c++容器vector
+
+## 第六讲：非线性优化
+
+即解决如何从有噪声的数据中进行准确的状态估计
+
+### 优化问题
+
+#### 凸优化
+
+他会有要求以及具体的形式，可以上网搜
+
+一定可以找到全局最小值
+
+#### 非凸优化
+
+不是凸优化的目标函数都叫非凸优化
+
+容易陷入局部最优解
+
+借助一些东西将非凸转换为凸优化，涉及到处值的选择等
+
+#### 数据来源
+
+批量式batch：一次给定一批观测数据
+
+增量式：数据随时间逐渐采集
+
+#### 优化对象
+
+可以选择位置，姿态，等传感器数据
+
+#### 约束条件
+
+我们往往很像把约束条件转化为无约束的问题，这样更为方便
+
+解决方法：将约束加在目标函数，转换对象空间（换元思想）
+
+#### 求解
+
+解析解：求导数，令其等于0
+
+数值接：解析解找不到的情况下，梯度下降
+
+#### 各种优化库
+
+ceres，g2o，gtsam，osqp，cvx，mosek，.....
+
+### 状态估计问题
+
+经典的slam由运动方程和观测方程构成：
+$$
+\begin{cases}\boldsymbol{x}_k=f\left(\boldsymbol{x}_{k-1},\boldsymbol{u}_k\right)+\boldsymbol{w}_k\\\boldsymbol{z}_{k,j}=h\left(\boldsymbol{y}_j,\boldsymbol{x}_k\right)+\boldsymbol{v}_{k,j}&\end{cases}
+$$
+假设在$x_k$处对路标$y_j$进行了一次观测，对应到图像上的像素位置$z_k,_j$，那么观测方程可以表示成：
+$$
+s\boldsymbol{z}_{k,j}=\boldsymbol{K}(\boldsymbol{R}_k\boldsymbol{y}_j+\boldsymbol{t}_k).
+$$
+其中s就是那个深度z，K是内参矩阵，R，t旋转与平移
+
+在运动与观测方程中我们通常假设**两个噪声服从零均值的高斯分布**（就是正态分布）。$R_k$，$Q_k,_j$是协方差矩阵
+$$
+\boldsymbol{w}_{k}\sim\mathcal{N}\left(\boldsymbol{0},\boldsymbol{R}_{k}\right),\boldsymbol{v}_{k}\sim\mathcal{N}\left(\boldsymbol{0},\boldsymbol{Q}_{k,j}\right).
+$$
+$R_k$，$Q_k,_j$为协方差矩阵。在这些噪声下我们希望通过带噪声的数据z（路标的像素坐标）和u（运动传感器的输入）来推断位姿x和地图y(以及他们的概率分布)，**这构成了一个状态估计问题**
+
+### 处理状态估计的方法
+
+**滤波器的概念：**
+
+> 根据z，u数据随时间的逐渐到来，我们持有一个当前时刻的估计状态，然后用新的数据来更新他。**这种方式叫做增量/渐进，或者滤波器**
+>
+> 欠缺累积误差的考虑
+
+另一种方式，
+
+把数据攒起来并处理，这种**方式成为批量法**。例如我们把0到k时刻的所有输入和观测数据放在一起，问：如何根据这些估计整个0到k的轨迹与地图
+
+现如今更常用**批量法**
+
+以及**滑动窗口**：
+
+> 一种折衷的手段，对一个固定的时间段中的数据进行优化，这个窗口就是一个时间窗口
+
+**前端后端**：
+
+每个一段时间积累一定数据后，在后端启动一次优化
+
+### 状态估计问题转换
+
+对机器人状态的估计，就是已知输入数据u和观测数据z条件下，求状态x,y的条件概率分布：
+$$
+P(\boldsymbol{x},\boldsymbol{y}|\boldsymbol{z},\boldsymbol{u}).
+$$
+**这实际上是一个由果得因的过程，这是不太好求解的，所以我们根据下面的贝叶斯进行转换**！
+
+特别的，当我们不知道控制输入，只有一张张图像，即只考虑观测方程带来的数据，相当于估计P(x,y|z)，此问题也成为sfm(structure form motion)，即如何从图像中重建三维空间
+
+**利用贝叶斯法则**：
+$$
+P\left(\boldsymbol{x},\boldsymbol{y}|\boldsymbol{z},\boldsymbol{u}\right)=\frac{P\left(\boldsymbol{z},\boldsymbol{u}|\boldsymbol{x},\boldsymbol{y}\right)P\left(\boldsymbol{x},\boldsymbol{y}\right)}{P\left(\boldsymbol{z},\boldsymbol{u}\right)}\propto\underbrace{P\left(\boldsymbol{z},\boldsymbol{u}|\boldsymbol{x},\boldsymbol{y}\right)}_\text{似然}{ \underbrace { P \left ( \boldsymbol { x },\boldsymbol{y}\right)}_\text{先验}{ .}}
+$$
+等式左侧称为**后验概率**，右侧的分母可以忽略。
+
+直接求后验分布是困难的，但是**求一个状态最优估计，使得在该状态下后验概率最大化是可行的。**
+$$
+(x,\boldsymbol{y})^{*}_{\mathrm{MAP}}=\arg\max P\left(\boldsymbol{x},\boldsymbol{y}|\boldsymbol{z},\boldsymbol{u}\right)=\arg\max P(\boldsymbol{z},\boldsymbol{u}|\boldsymbol{x},\boldsymbol{y})P(\boldsymbol{x},\boldsymbol{y}).
+$$
+当然会有情况我们不知道机器人位姿和路标在哪里即不知道先验数据。
+
+此时可以求解**最大似然估计**（MLE）：
+$$
+(\boldsymbol{x},\boldsymbol{y})^{*}_{\mathrm{MLE}}=\arg\max P(\boldsymbol{z},\boldsymbol{u}|\boldsymbol{x},\boldsymbol{y}).
+$$
+可以理解成为：在现在的位姿下，可能产生怎样的观测数据。由于我们知道观测数据，所以最大似然可以理解为：**在什么样的状态下，最可能产生现在观测到的数据**
+
+**以上将最大后验概率求解转换为了求最大似然与先验概率的最大值，但有些情况不知道先验，所以又约等于为了最大似然概率**
+
+### 状态估计---观测误差
+
+对于某次观测：
+$$
+\boldsymbol{z}_{k,j}=h\left(\boldsymbol{y}_{j},\boldsymbol{x}_{k}\right)+\boldsymbol{v}_{k,j},
+$$
+由于假设噪声服从均值为0的高斯分布，那么似然估计服从如下分布：
+
+> 由于h是准确的其方差为0，均值就为h(yj,xk)，vk,j相加得到
+>
+> 均值与方差的传递
+
+$$
+P(\boldsymbol{z}_{j,k}|\boldsymbol{x}_k,\boldsymbol{y}_j)=N\left(h(\boldsymbol{y}_j,\boldsymbol{x}_k),\boldsymbol{Q}_{k,j}\right).
+$$
+
+以下就涉及到多元高斯分布，可看slam课本的论述
+
+首先对这个多元正态分布的概率密度函数取一个负对数得到一个式子，所以求原函数的最大值就相当于求负对数的最小值。之后去掉常数项，再代入似然估计所服从的正态分布最终得到：
+$$
+\begin{aligned}
+(\boldsymbol{x}_{k},\boldsymbol{y}_{j})^{*}& =\arg\max\mathcal{N}(h(\boldsymbol{y}_j,\boldsymbol{x}_k),\boldsymbol{Q}_{k,j}) \\
+&=\arg\min\left(\left(\boldsymbol{z}_{k,j}-h\left(\boldsymbol{x}_{k},\boldsymbol{y}_{j}\right)\right)^{\mathrm{T}}\boldsymbol{Q}_{k,j}^{-1}\left(\boldsymbol{z}_{k,j}-h\left(\boldsymbol{x}_{k},\boldsymbol{y}_{j}\right)\right)\right).
+\end{aligned}
+$$
+
+#### 针对批量数据
+
+首先引入一个假设，各个时刻的输入和观测是相互独立的。于是我们可以进一步化简：
+$$
+P\left(z,\boldsymbol{u}|\boldsymbol{x},\boldsymbol{y}\right)=\prod_{k}P\left(\boldsymbol{u}_{k}|\boldsymbol{x}_{k-1},\boldsymbol{x}_{k}\right)\prod_{k,j}P\left(\boldsymbol{z}_{k,j}|\boldsymbol{x}_{k},\boldsymbol{y}_{j}\right),
+$$
+这说明我们可以独立地处理各个时刻的运动和观测：
+$$
+\begin{gathered}
+e_{\boldsymbol{u},k} =\boldsymbol{x}_k-f\left(\boldsymbol{x}_{k-1},\boldsymbol{u}_k\right) \\
+e_{\boldsymbol{z},j,k} =\boldsymbol{z}_{k,j}-h\left(\boldsymbol{x}_k,\boldsymbol{y}_j\right), 
+\end{gathered}
+$$
+最终得到：
+$$
+\min J(\boldsymbol{x},\boldsymbol{y})=\sum_k\boldsymbol{e}_{\boldsymbol{u},k}^\mathrm{T}\boldsymbol{R}_k^{-1}\boldsymbol{e}_{\boldsymbol{u},k}+\sum_k\sum_j\boldsymbol{e}_{\boldsymbol{z},k,j}^\mathrm{T}\boldsymbol{Q}_{k,j}^{-1}\boldsymbol{e}_{\boldsymbol{z},k,j}.
+$$
+**他的解等价于最大的似然估计**
+
+#### 具体例子（看书）
+
+### 矩阵求导
+
+https://en.wikipedia.org/wiki/Matrix_calculus查表
+
+| types  |             Scalar              | Vector | Matrix |
+| :----: | :-----------------------------: | :----: | :----: |
+| Scalar | $\frac{\partial y}{\partial x}$ |        |        |
+| Vector |                                 |        |        |
+| Matrix |                                 |        |        |
+
+各个量之间的求导关系
+
+**向量与向量：**
+
+即因变量对每个自变量分别求导再放入矩阵，放入的规则有所不同，**分母排列（用他一般）（因变量在横向上变化）**，分子排列
+
+....别的求导也很简单
+
+### 非线性最小二乘
+
+见ipad
+
+也可阅读slam课本，非常简单，明白意思即可，太多的数学细节是非必要的。
+
+### 实践部分
+
+题目描述见书
+
+
+
+## 第七讲：视觉里程计
+
+前端也被称为视觉里程计，其根据相邻图像的信息估计出粗略的相机运动，给后端提供良好的初始值。视觉里程计的算法分为两个大类：**特征点法**和直接法
+
+特征点法为当前的主流方法
+
+### 特征点
+
+从图像中选取具有代表性的点，这些点在相机视角发生少量变化后会保持不变，于是可以在各个图像中找到具有代表性的点，在视觉slam中称其为图像特征（Fearure）
+
+特征是图像信息的另一种数字表达形式
+
+特征点是图像中一些特别的地方，由**关键点**和**描述子**组成如：**角点、**边缘...
+
+> 关键点：是指特征点在图像里的**位置**，有些特征点还具有**朝向、大小**等信息
+>
+> 描述子：通常是一个向量，按照人为方式设计的，**描述了该关键点周围像素信息**。其是按照外观相似的特征应该具有相似的描述子设计的。因而两个特征点的描述子在向量空间上距离很近，就可以认为他们是同样的特性点
+
+同时这个角点边缘均有其弊端，之后研究者设计了有许多提取特征点的方法如heroslam中的superpoint
+
+### 特征匹配
+
+特征匹配解决了SLAM中的**数据关联**问题，即确定当前看到的路标与之前看到的路标之间的对应关系。
+
+对于浮点类型的描述子，使用欧氏距离进行度量。对于二进制的描述子使用汉明距离（Hamming distance）指的是不同位数的个数
+
+在进行匹配时我们选取快速近似最近邻算法（FLANN）
+
+**特征匹配是对描述子进行匹配，而描述子是在得到关键点后经过一些算法得到每个关键点相应的描述子**
+
+### ORB的例子
+
+关键点：Oriented FAST
+
+描述子：BRIF
+
+### 实践部分
+
+作者分别使用opencv库和手动实现了一个orb特征的提取和匹配，包括关键点的提取，描述子的计算和匹配。
+
+### 计算相机运动
+
+当我们完成匹配之后接下来很重要的一步是根据点估计相机的运动。
+
+接下来的匹配分为以下三种情况：
+
+1.单目相机：只知道2D坐标，因而是根据两组2D点估计运动。使用**对极几何**解决
+
+2.双目、RGB-D相机：根据两组3D点估计运动。**ICP解决**
+
+3.一组3D、一组2D：通过**PnP**求解
+
+#### 2D-2D：对极几何
+
+**对极约束**简洁的给出了两个匹配点的空间位置关系。
+$$
+x_2^\mathrm{T}t^\wedge R\boldsymbol{x}_1=0.
+$$
+其中x2，x1为两张图像上的两个像素点在相机归一化平面上的坐标。
+
+也可以是：
+$$
+p_2^{\mathrm{T}}K^{-\mathrm{T}}t^{\wedge}RK^{-1}p_1=0.
+$$
+其中p2，p1就是匹配点在两张图像的像素坐标了
+
+其中记基础矩阵F和本质矩阵E：
+$$
+E=t^{\wedge}R,\quad F=K^{-\top}EK^{-1},\quad x_{2}^{\mathrm{T}}Ex_{1}=p_{2}^{\mathrm{T}}Fp_{1}=0.
+$$
+于是相机位姿的估计就变为以下两步：
+
+1.根据配对点的像素位置求出E或F
+
+2.根据E或者F求出R，t
+
+##### 以E为例进行求解
+
+本质矩阵E是一个3x3矩阵，有9个未知数。
+
+使用八点法求解
+
+根据对极约束有：
+$$
+\begin{pmatrix}u_2,v_2,1\end{pmatrix}\begin{pmatrix}e_1&e_2&e_3\\\\e_4&e_5&e_6\\\\e_7&e_8&e_9\end{pmatrix}\begin{pmatrix}u_1\\\\v_1\\\\1\end{pmatrix}=0.
+$$
+将8对匹配的特征点放入以下方程中，根据一系列推导E中的元素为下面方程的解：
+$$
+\begin{pmatrix}u_1^1u_1^1&u_2^1v_1^1&u_2^1&v_2^1u_1^1&v_1^1v_1^1&v_2^1&u_1^1&v_1^1&1\\u_2^2u_1^2&u_2^2v_1^2&u_2^2&v_2^2u_1^2&v_2^2v_1^2&v_2^2&v_1^2&1\\\vdots&\vdots&\vdots&\vdots&\vdots&\vdots&\vdots&\vdots\\u_2^8u_1^8&u_2^8&u_2^8&v_2^8u_1^8&v_2^8v_1^8&v_2^8&u_1^8&v_1^8&1\end{pmatrix}\begin{pmatrix}e_1\\e_2\\e_3\\e_4\\e_5\\e_6\\e_7\\e_8\\e_9\end{pmatrix}=0.
+$$
+得到E之后便要求解R，t，该过程由SVD求解
+$$
+\begin{gathered}
+\text{t1} =\boldsymbol{UR}_{Z}(\frac{\pi}{2})\boldsymbol{\Sigma U}^{\mathrm{T}},\quad\boldsymbol{R}_{1}=\boldsymbol{UR}_{Z}^{\mathrm{T}}(\frac{\pi}{2})\boldsymbol{V}^{\mathrm{T}} \\
+t_2 =\boldsymbol{UR}_{Z}(-\frac{\pi}{2})\boldsymbol{\Sigma U}^{\mathrm{T}},\quad\boldsymbol{R}_{2}=\boldsymbol{UR}_{Z}^{\mathrm{T}}(-\frac{\pi}{2})\boldsymbol{V}^{\mathrm{T}}. 
+\end{gathered}
+$$
+共得到两组解，还需代入具体的一点来进行确认。
+
+**计算得到本质矩阵E**：
+
+```
+//-- 计算本质矩阵
+  Point2d principal_point(325.1, 249.7);  //相机光心, TUM dataset标定值
+  double focal_length = 521;      //相机焦距, TUM dataset标定值
+  Mat essential_matrix;
+  essential_matrix = findEssentialMat(points1, points2, focal_length, principal_point);
+  cout << "essential_matrix is " << endl << essential_matrix << endl;
+```
+
+**分解得到R，t：**
+
+```
+/-- 从本质矩阵中恢复旋转和平移信息.
+  // 此函数仅在Opencv3中提供
+  recoverPose(essential_matrix, points1, points2, R, t, focal_length, principal_point);
+  cout << "R is " << endl << R << endl;
+  cout << "t is " << endl << t << endl;
+```
+
+##### 单应矩阵求解
+
+单应性矩阵描述了两个平面之间的映射关系。若场景中特征点都落在同一平面上（墙壁、地面）则可通过其进行运动估计
+
+单应性矩阵是什么以及应用：https://blog.csdn.net/wangmj_hdu/article/details/119138199
+
+**计算单应性矩阵：**
+
+```
+//-- 计算单应矩阵
+  //-- 但是本例中场景不是平面，单应矩阵意义不大
+  Mat homography_matrix;
+  homography_matrix = findHomography(points1, points2, RANSAC, 3);
+  cout << "homography_matrix is " << endl << homography_matrix << endl;
+```
+
+分解得到R，t：https://blog.csdn.net/weixin_43955005/article/details/126206930#:~:text=%E8%AF%A5%E5%87%BD%E6%95%B0%E5%8F%AF%E4%BB%A5%E9%80%9A%E8%BF%87%E5%8D%95%E5%BA%94%E7%9F%A9
+
+##### 2D-2D本质矩阵的一个问题
+
+从E分解得到R，t的过程中，如果发生的是纯旋转，导致t为0.那么得到的E也将为0，这样无法求解R。
+
+**因而单目初始化不能只有纯旋转，必须有一定程度平移。**
+
+
+
+#### 三角测量
+
+在得到运动关系之后，下一步需要用相机的运动估计特征点的空间位置。即使用三角测量方法估计地图点的**深度**。
+
+三角测量是指：通过不同位置对同一个路标点进行观察，从观察到的位置推断路标点的距离。
+
+![](/home/zbw/图片/2024-10-07 22-09-40 的屏幕截图.png)
+
+如图，由于噪声影响直线O1P1与O2P2往往无法相交。因此通过最小二乘求解。
+
+设$x_1$,$x_2$为两个特征点的归一化坐标，我们有： $ s_ {2} $ $ x_ {2} $ = $ s_ {1} $ $ Rx_ {1} $ +t.
+
+现在已知R，t，要求解两个特征点的深度s1，s2.
 
 
 
